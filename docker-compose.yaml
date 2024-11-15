@@ -1,0 +1,196 @@
+volumes:
+  zookeeper-data:
+    driver: local
+  zookeeper-log:
+    driver: local
+  kafka-data:
+    driver: local
+  flink-data:
+    driver: local
+
+services:
+  zookeeper:
+    image: quay.io/debezium/zookeeper:1.9.7.Final
+    ports:
+      - 2181:2181
+      - 2888:2888
+      - 3888:3888
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data:Z
+      - zookeeper-log:/var/lib/zookeeper/log:Z
+
+  kafka:
+    image: quay.io/debezium/kafka:1.9.7.Final
+    links:
+      - zookeeper
+    ports:
+      - "29092:29092"
+      - "9092:9092"
+    environment:
+      - ZOOKEEPER_CONNECT=zookeeper:2181
+      - KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      - KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      - KAFKA_LISTENERS=PLAINTEXT://0.0.0.0:29092,PLAINTEXT_HOST://0.0.0.0:9092
+    volumes:
+      - kafka-data:/var/lib/kafka/data:Z
+
+  akhq:
+    image: tchiotludo/akhq
+    restart: unless-stopped
+    environment:
+      AKHQ_CONFIGURATION: |
+        akhq:
+          connections:
+            docker-kafka-server:
+              properties:
+                bootstrap.servers: "kafka:29092"
+    ports:
+      - 8080:8080
+    links:
+      - kafka
+
+  jobmanager-data-gen:
+    build: .
+    image: flink-pageviews:latest
+    ports:
+      - "8081:8081"
+    command: standalone-job --job-classname org.apache.flink.DataGeneratorJob --kafkaBootstrapServer kafka:29092
+    volumes:
+      - flink-data:/tmp/
+    links:
+      - kafka
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager-data-gen
+        parallelism.default: 2
+        state.backend: hashmap
+        state.checkpoints.dir: file:///tmp/data-gen/checkpoints
+        state.savepoints.dir: file:///tmp/data-gen/savepoints
+        execution.checkpointing.interval: 1 min
+
+  taskmanager-data-gen:
+    build: .
+    image: flink-pageviews:latest
+    depends_on:
+      - jobmanager-data-gen
+      - kafka
+    command: taskmanager
+    scale: 1
+    volumes:
+      - flink-data:/tmp/
+    links:
+      - jobmanager-data-gen
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager-data-gen
+        taskmanager.numberOfTaskSlots: 2
+        parallelism.default: 2
+        state.backend: hashmap
+        state.checkpoints.dir: file:///tmp/data-gen/checkpoints
+        state.savepoints.dir: file:///tmp/data-gen/savepoints
+        execution.checkpointing.interval: 1 min
+
+  jobmanager-raw-sink:
+    build: .
+    image: flink-pageviews:latest
+    depends_on:
+      - jobmanager-data-gen
+    ports:
+      - "8082:8081"
+    command: |
+      standalone-job
+        --job-classname org.apache.flink.RawSinkJob
+        --kafkaBootstrapServer kafka:29092
+        --icebergWarehousePath file:///data_output/iceberg
+        --rawSinkPath file:///data_output/raw
+    volumes:
+      - flink-data:/tmp/
+      - ./data_output:/data_output
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager-raw-sink
+        parallelism.default: 2
+        state.backend: hashmap
+        state.checkpoints.dir: file:///tmp/raw-sink/checkpoints
+        state.savepoints.dir: file:///tmp/raw-sink/savepoints
+        execution.checkpointing.interval: 1 min
+    links:
+      - kafka
+
+  taskmanager-raw-sink:
+    build: .
+    image: flink-pageviews:latest
+    depends_on:
+      - jobmanager-raw-sink
+    command: taskmanager
+    scale: 1
+    volumes:
+      - flink-data:/tmp/
+      - ./data_output:/data_output
+    links:
+      - jobmanager-raw-sink
+      - kafka
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager-raw-sink
+        taskmanager.numberOfTaskSlots: 2
+        parallelism.default: 2
+        state.backend: hashmap
+        state.checkpoints.dir: file:///tmp/raw-sink/checkpoints
+        state.savepoints.dir: file:///tmp/raw-sink/savepoints
+        execution.checkpointing.interval: 1 min
+
+  jobmanager-aggregate:
+    build: .
+    image: flink-pageviews:latest
+    depends_on:
+      - jobmanager-data-gen
+    ports:
+      - "8083:8081"
+    command: |
+      standalone-job 
+        --job-classname org.apache.flink.PostcodeAggregateJob 
+        --kafkaBootstrapServer kafka:29092
+        --icebergWarehousePath file:///data_output/iceberg
+    volumes:
+      - flink-data:/tmp/
+      - ./data_output:/data_output
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager-aggregate
+        parallelism.default: 2
+        state.backend: rocksdb
+        state.checkpoints.dir: file:///tmp/aggregate/checkpoints
+        state.savepoints.dir: file:///tmp/aggregate/savepoints
+        execution.checkpointing.interval: 1 min
+    links:
+      - kafka
+
+  taskmanager-aggregate:
+    build: .
+    image: flink-pageviews:latest
+    depends_on:
+      - jobmanager-aggregate
+    command: taskmanager
+    scale: 1
+    volumes:
+      - flink-data:/tmp/
+      - ./data_output:/data_output
+    links:
+      - jobmanager-aggregate
+      - kafka
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: jobmanager-aggregate
+        taskmanager.numberOfTaskSlots: 2
+        parallelism.default: 2
+        state.backend: rocksdb
+        state.checkpoints.dir: file:///tmp/aggregate/checkpoints
+        state.savepoints.dir: file:///tmp/aggregate/savepoints
+        execution.checkpointing.interval: 1 min
