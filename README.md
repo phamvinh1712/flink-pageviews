@@ -50,7 +50,8 @@ docker build -t flink-pageviews .
 ```shell
 mkdir data_output
 ```
-- Deploy the pipeline with docker-compose
+- Deploy with docker-compose, startup, all components including Kafka, data generator and flink jobs will start to run
+
 ```shell
 docker-compose up
 ```
